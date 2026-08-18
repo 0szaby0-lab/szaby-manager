@@ -1,4 +1,4 @@
-package app.morphe.manager.patcher.runtime.process;
+package com.szaby.manager.patcher.runtime.process;
 
 // Interface for sending events back to the main app process
 oneway interface IPatcherEvents {
@@ -10,3 +10,4 @@ oneway interface IPatcherEvents {
     // The patching process has ended. The exceptionStackTrace is null if it finished successfully
     void finished(String exceptionStackTrace);
 }
+

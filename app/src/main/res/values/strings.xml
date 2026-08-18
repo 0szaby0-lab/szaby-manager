@@ -1287,4 +1287,11 @@ Do you still want to continue?"</string>
     <string name="tour_prompt_confirm">Show me around</string>
     <string name="onboarding_restart_title">Feature tour</string>
     <string name="onboarding_restart_desc">Take a guided tour of Szaby\'s key features</string>
+
+    <!-- Missing Morphe-to-Szaby renamed strings -->
+    <string name="morphe_experimental_app_version_dialog_title">Experimental app version</string>
+    <string name="morphe_experimental_app_version_dialog_message">The version of %s you are about to patch is experimental and may have issues.</string>
+    <string name="settings_appearance_style_morphe">Szaby</string>
+    <string name="settings_system_morphe_settings">Szaby settings</string>
 </resources>
+

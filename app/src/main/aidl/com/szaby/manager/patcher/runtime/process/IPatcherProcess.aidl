@@ -1,8 +1,8 @@
 // IPatcherProcess.aidl
-package app.morphe.manager.patcher.runtime.process;
+package com.szaby.manager.patcher.runtime.process;
 
-import app.morphe.manager.patcher.runtime.process.Parameters;
-import app.morphe.manager.patcher.runtime.process.IPatcherEvents;
+import com.szaby.manager.patcher.runtime.process.Parameters;
+import com.szaby.manager.patcher.runtime.process.IPatcherEvents;
 
 interface IPatcherProcess {
     // Returns BuildConfig.BUILD_ID, which is used to ensure the main app and runner process are running the same code.
