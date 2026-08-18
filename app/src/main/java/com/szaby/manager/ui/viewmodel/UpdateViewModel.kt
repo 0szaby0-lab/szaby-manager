@@ -1,0 +1,518 @@
+package com.szaby.manager.ui.viewmodel
+
+import android.app.Application
+import android.content.*
+import androidx.annotation.StringRes
+import androidx.compose.runtime.*
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.szaby.manager.BuildConfig
+import com.szaby.manager.R
+import com.szaby.manager.data.platform.Filesystem
+import com.szaby.manager.data.platform.NetworkInfo
+import com.szaby.manager.domain.installer.InstallCancelledException
+import com.szaby.manager.domain.installer.InstallResult
+import com.szaby.manager.domain.installer.InstallerManager
+import com.szaby.manager.domain.installer.SessionInstaller
+import com.szaby.manager.domain.manager.PreferencesManager
+import com.szaby.manager.domain.repository.ManagerUpdateRepository
+import com.szaby.manager.network.api.MorpheAPI
+import com.szaby.manager.network.dto.MorpheAsset
+import com.szaby.manager.network.service.AssetDownloader
+import com.szaby.manager.util.*
+import kotlinx.coroutines.*
+import org.koin.core.component.KoinComponent
+import org.koin.core.component.inject
+import java.io.File
+import java.io.IOException
+import kotlin.time.Duration.Companion.seconds
+
+class UpdateViewModel(
+    private val downloadOnScreenEntry: Boolean,
+    private val network: NetworkInfo,
+) : ViewModel(), KoinComponent {
+    private val app: Application by inject()
+    private val morpheAPI: MorpheAPI by inject()
+    private val managerUpdateRepository: ManagerUpdateRepository by inject()
+    private val assetDownloader: AssetDownloader by inject()
+    private val sessionInstaller: SessionInstaller by inject()
+    private val networkInfo: NetworkInfo by inject()
+    private val fs: Filesystem by inject()
+    private val prefs: PreferencesManager by inject()
+    private val installerManager: InstallerManager by inject()
+
+    private var pendingExternalInstall: InstallerManager.InstallPlan.External? = null
+    private var externalInstallTimeoutJob: Job? = null
+    private var currentDownloadVersion: String? = null
+
+    var downloadedSize by mutableLongStateOf(0L)
+        private set
+    var totalSize by mutableLongStateOf(0L)
+        private set
+    val downloadProgress by derivedStateOf {
+        if (downloadedSize == 0L || totalSize == 0L) return@derivedStateOf 0f
+
+        downloadedSize.toFloat() / totalSize.toFloat()
+    }
+    var showInternetCheckDialog by mutableStateOf(false)
+    var state by mutableStateOf(State.CAN_DOWNLOAD)
+
+    var installError by mutableStateOf("")
+
+    // Release info for update dialog
+    var releaseInfo: MorpheAsset? by mutableStateOf(null)
+        private set
+
+    // True while an update check is in flight, so the dialog can tell a check that is still
+    // resolving apart from one that resolved to nothing
+    var isCheckingForUpdate by mutableStateOf(true)
+        private set
+
+    // Changelog entries for the current channel (shown in Settings → Changelog).
+    // Stable channel: single entry for the installed version.
+    // Prerelease channel: the installed dev version and every preceding dev entry down to
+    // (but not including) the last stable release; the "Show older" expander then continues
+    // from the stable baseline.
+    var currentChannelChangelogEntries: List<ChangelogEntry>? by mutableStateOf(null)
+        private set
+
+    // All changelog entries newer than the currently installed version (shown in update dialog)
+    var missedChangelogEntries: List<ChangelogEntry>? by mutableStateOf(null)
+        private set
+
+    // Older changelog entries loaded on-demand by the "Show older releases" expander.
+    // Reset on dialog dismiss so the expander reopens in a collapsed state next time
+    var olderManagerEntries: List<ChangelogEntry>? by mutableStateOf(null)
+        private set
+    var isLoadingOlderEntries by mutableStateOf(false)
+        private set
+
+    // Parsed CHANGELOG.md per branch (false = main, true = dev). Shared across all loaders
+    // and the older-entries expander to avoid duplicate fetches inside one VM lifetime
+    private val managerEntriesCache = mutableMapOf<Boolean, List<ChangelogEntry>>()
+
+    var canResumeDownload by mutableStateOf(false)
+        private set
+
+    private val location = fs.tempDir.resolve("updater.apk")
+    private var job = resolveUpdate()
+
+    /**
+     * Resolves the available update through [ManagerUpdateRepository] so the dialog shows the
+     * same release the home banner announced, then loads its changelog.
+     */
+    private fun resolveUpdate() = viewModelScope.launch {
+        isCheckingForUpdate = true
+        try {
+            uiSafe(app, R.string.download_manager_failed, "Failed to download Morphe Manager") {
+                releaseInfo = managerUpdateRepository.getOrRefresh()
+            }
+        } finally {
+            isCheckingForUpdate = false
+        }
+
+        if (releaseInfo == null) {
+            state = State.CAN_DOWNLOAD
+            return@launch
+        }
+
+        loadMissedChangelog()
+
+        if (downloadOnScreenEntry) {
+            downloadUpdate()
+        } else {
+            state = State.CAN_DOWNLOAD
+        }
+    }
+
+    /**
+     * Re-runs the update check. Offered when the check resolved nothing, which happens while
+     * a release is announced but its APK is still uploading.
+     */
+    fun retryUpdateCheck() {
+        if (isCheckingForUpdate) return
+        job = resolveUpdate()
+    }
+
+    val isConnected: Boolean
+        get() = network.isConnected()
+
+    fun downloadUpdate(ignoreInternetCheck: Boolean = false) = viewModelScope.launch {
+        uiSafe(app, R.string.failed_to_download_update, "Failed to download update") {
+            val release = releaseInfo ?: return@uiSafe
+            val allowMeteredUpdates = prefs.allowMeteredUpdates.get()
+
+            if (!allowMeteredUpdates && networkInfo.isMetered() && !ignoreInternetCheck) {
+                showInternetCheckDialog = true
+                return@uiSafe
+            }
+
+            if (currentDownloadVersion != release.version) {
+                currentDownloadVersion = release.version
+                withContext(Dispatchers.IO) { location.delete() }
+                downloadedSize = 0L
+                totalSize = 0L
+                canResumeDownload = false
+            }
+
+            val resumeOffset = withContext(Dispatchers.IO) {
+                if (location.exists()) location.length() else 0L
+            }
+            downloadedSize = resumeOffset
+            // totalSize stays 0 until first progress callback - avoids false 100% on resume
+            totalSize = 0L
+            canResumeDownload = resumeOffset > 0L
+
+            state = State.DOWNLOADING
+
+            try {
+                withContext(Dispatchers.IO) {
+                    // Routed through AssetDownloader so the manager update survives a blocked
+                    // github.com the same way patch bundles do
+                    assetDownloader.downloadToFile(
+                        downloadUrl = release.downloadUrl,
+                        saveLocation = location,
+                        resumeFrom = resumeOffset,
+                        onProgress = { bytesRead, contentLength ->
+                            downloadedSize = bytesRead
+                            totalSize = contentLength ?: totalSize
+                        }
+                    )
+                }
+                requireApkArchive(location)
+                canResumeDownload = false
+                installUpdate().join()
+            } catch (error: Exception) {
+                val downloaded = withContext(Dispatchers.IO) {
+                    location.takeIf { it.exists() }?.length() ?: 0L
+                }
+                downloadedSize = downloaded
+                if (totalSize < downloadedSize) totalSize = downloadedSize
+                canResumeDownload = downloadedSize > 0L
+                state = State.CAN_DOWNLOAD
+                throw error
+            }
+        }
+    }
+
+    /**
+     * Rejects a download that transferred cleanly but is not an APK, so the installer is never
+     * handed an error page or an API response that arrived in the file's place. The partial file
+     * is dropped as well, otherwise the next attempt would resume on top of it.
+     */
+    private suspend fun requireApkArchive(location: File) = withContext(Dispatchers.IO) {
+        if (location.hasZipHeader()) return@withContext
+
+        val size = runCatching { location.length() }.getOrDefault(0L)
+        runCatching { location.delete() }
+        throw IOException("The downloaded update is not an APK (size=$size)")
+    }
+
+    fun installUpdate() = viewModelScope.launch {
+        pendingExternalInstall?.let(installerManager::cleanup)
+        pendingExternalInstall = null
+        externalInstallTimeoutJob?.cancel()
+        externalInstallTimeoutJob = null
+        installError = ""
+
+        val plan = installerManager.resolvePlan(
+            InstallerManager.InstallTarget.MANAGER_UPDATE,
+            location,
+            app.packageName,
+            app.getString(R.string.app_name)
+        )
+
+        when (plan) {
+            is InstallerManager.InstallPlan.Internal -> {
+                state = State.INSTALLING
+                sessionInstaller.launchIntentInstall(location)
+                // Completion handled by installBroadcastReceiver;
+                // cancellation handled by resetIfInstallCancelled() in the dialog
+            }
+
+            is InstallerManager.InstallPlan.PlayStore -> {
+                state = State.INSTALLING
+                sessionInstaller.launchPlayStoreInstall(location)
+            }
+
+            is InstallerManager.InstallPlan.RootPlayStore -> {
+                val hint = app.getString(R.string.installer_status_not_supported)
+                app.toast(app.getString(R.string.install_app_fail, hint))
+                installError = hint
+                canResumeDownload = false
+                state = State.FAILED
+            }
+
+            is InstallerManager.InstallPlan.ShizukuPlayStore -> {
+                val hint = app.getString(R.string.installer_status_not_supported)
+                app.toast(app.getString(R.string.install_app_fail, hint))
+                installError = hint
+                canResumeDownload = false
+                state = State.FAILED
+            }
+
+            is InstallerManager.InstallPlan.Mount -> {
+                val hint = app.getString(R.string.installer_status_not_supported)
+                app.toast(app.getString(R.string.install_app_fail, hint))
+                installError = hint
+                canResumeDownload = false
+                state = State.FAILED
+            }
+
+            is InstallerManager.InstallPlan.Shizuku -> {
+                state = State.INSTALLING
+                try {
+                    handleInstallResult(sessionInstaller.installShizuku(location, app.packageName))
+                } catch (_: InstallCancelledException) {
+                    state = State.CAN_INSTALL
+                } catch (e: Exception) {
+                    val message = e.simpleMessage().orEmpty()
+                    installError = message
+                    canResumeDownload = false
+                    app.toast(app.getString(R.string.install_app_fail, message))
+                    state = State.FAILED
+                }
+            }
+
+            is InstallerManager.InstallPlan.External -> launchExternalInstaller(plan)
+        }
+    }
+
+    private fun handleInstallResult(result: InstallResult) {
+        when (result) {
+            InstallResult.Success -> {
+                installError = ""
+                state = State.SUCCESS
+                app.toast(app.getString(R.string.install_app_success))
+            }
+            is InstallResult.Conflict -> {
+                installError = app.getString(R.string.installer_hint_conflict)
+                canResumeDownload = false
+                app.toast(installError)
+                state = State.FAILED
+            }
+            is InstallResult.Failure -> {
+                val message = result.message ?: "Unknown error"
+                installError = message
+                canResumeDownload = false
+                app.toast(app.getString(R.string.install_app_fail, message))
+                state = State.FAILED
+            }
+        }
+    }
+
+    private fun launchExternalInstaller(plan: InstallerManager.InstallPlan.External) {
+        pendingExternalInstall?.let(installerManager::cleanup)
+        externalInstallTimeoutJob?.cancel()
+
+        pendingExternalInstall = plan
+        installError = ""
+        try {
+            // Add FLAG_ACTIVITY_NEW_TASK since we're starting from Application context
+            plan.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            app.startActivity(plan.intent)
+            app.toast(app.getString(R.string.installer_external_launched, plan.installerLabel))
+        } catch (error: ActivityNotFoundException) {
+            installerManager.cleanup(plan)
+            pendingExternalInstall = null
+            installError = error.simpleMessage().orEmpty()
+            app.toast(app.getString(R.string.install_app_fail, error.simpleMessage()))
+            state = State.FAILED
+            return
+        }
+
+        state = State.INSTALLING
+
+        externalInstallTimeoutJob = viewModelScope.launch {
+            delay(EXTERNAL_INSTALL_TIMEOUT)
+            if (pendingExternalInstall == plan) {
+                installerManager.cleanup(plan)
+                pendingExternalInstall = null
+                installError = app.getString(R.string.installer_external_timeout, plan.installerLabel)
+                app.toast(installError)
+                state = State.FAILED
+                externalInstallTimeoutJob = null
+            }
+        }
+    }
+
+    private fun handleExternalInstallSuccess(packageName: String) {
+        val plan = pendingExternalInstall
+        if (plan != null) {
+            if (plan.expectedPackage != packageName) return
+            pendingExternalInstall = null
+            externalInstallTimeoutJob?.cancel()
+            externalInstallTimeoutJob = null
+            installerManager.cleanup(plan)
+            app.toast(app.getString(R.string.installer_external_success, plan.installerLabel))
+        } else {
+            // Intent-based fallback - only care about our own package
+            if (packageName != app.packageName) return
+        }
+        installError = ""
+        state = State.SUCCESS
+    }
+
+    private val installBroadcastReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_PACKAGE_ADDED,
+                Intent.ACTION_PACKAGE_REPLACED -> {
+                    val pkg = intent.data?.schemeSpecificPart ?: return
+                    handleExternalInstallSuccess(pkg)
+                }
+            }
+        }
+    }
+
+    init {
+        ContextCompat.registerReceiver(app, installBroadcastReceiver, IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED)
+            addAction(Intent.ACTION_PACKAGE_REPLACED)
+            addDataScheme("package")
+        }, ContextCompat.RECEIVER_NOT_EXPORTED)
+    }
+
+    override fun onCleared() {
+        app.unregisterReceiver(installBroadcastReceiver)
+
+        pendingExternalInstall?.let(installerManager::cleanup)
+        pendingExternalInstall = null
+        externalInstallTimeoutJob?.cancel()
+        externalInstallTimeoutJob = null
+
+        job.cancel()
+        location.delete()
+    }
+
+    /**
+     * Reset state if an external installation timed out or was abandoned.
+     */
+    fun resetIfInstallCancelled() {
+        // If we're in INSTALLING state but the pending installation was canceled,
+        // reset to CAN_INSTALL so user can try again
+        if (state == State.INSTALLING && pendingExternalInstall == null) {
+            state = if (location.exists() && location.length() > 0) {
+                State.CAN_INSTALL
+            } else {
+                canResumeDownload = false
+                State.CAN_DOWNLOAD
+            }
+        }
+    }
+
+    /**
+     * Load all changelog entries newer than the currently installed version.
+     * Called automatically after a successful update check.
+     */
+    private fun loadMissedChangelog() = viewModelScope.launch {
+        uiSafe(app, R.string.download_manager_failed, "Failed to load changelog") {
+            val installedVersion = BuildConfig.VERSION_NAME.normalizeVersion()
+
+            // Use the dev branch if EITHER the installed version is a dev build OR the available
+            // update is a pre-release. Without this, a stable user who has "Use pre-releases"
+            // enabled would fetch CHANGELOG.md from main, which doesn't contain dev entries,
+            // causing entriesNewerThan() to return an empty list even though a newer dev version
+            // is available and its changelog lives on the dev branch
+            val targetIsPrerelease = releaseInfo?.version?.contains('-') == true
+            val forDevBranch = morpheAPI.isDevBuild || targetIsPrerelease
+            val entries = managerEntriesCache.getOrPut(forDevBranch) {
+                morpheAPI.fetchManagerChangelog(forDevBranch = forDevBranch)
+            }
+            val newer = ChangelogParser.entriesNewerThan(entries, installedVersion)
+            // Strip pre-release entries when on stable channel - main CHANGELOG.md
+            // contains merged pre-release entries that stable users should not see
+            val filtered = if (forDevBranch) newer else newer.filter { !it.isPrerelease }
+            // Right after a release the raw CDN can still serve a CHANGELOG.md that predates
+            // it, so fall back to the notes the release itself carries rather than show nothing
+            missedChangelogEntries = filtered.ifEmpty { listOfNotNull(releaseNotesEntry()) }
+        }
+    }
+
+    /**
+     * Builds a changelog entry from the release notes attached to the update.
+     * The leading version heading is dropped because the entry header already shows it.
+     */
+    private fun releaseNotesEntry(): ChangelogEntry? {
+        val release = releaseInfo ?: return null
+        val lines = release.description.trim().lines()
+        val body = if (lines.firstOrNull()?.trimStart()?.startsWith("# ") == true) lines.drop(1) else lines
+        val notes = body.joinToString("\n").trim()
+
+        return if (notes.isBlank()) null else ChangelogEntry(
+            version = release.version.normalizeVersion(),
+            date = release.createdAt.date.toString(),
+            content = notes
+        )
+    }
+
+    /**
+     * Load changelog entries for the current channel from CHANGELOG.md.
+     *
+     * Stable channel: the installed version's entry only.
+     * Prerelease channel: the installed dev version and every preceding dev entry down to
+     * (but not including) the last stable release.
+     */
+    fun loadCurrentVersionChangelog() = viewModelScope.launch {
+        uiSafe(app, R.string.download_manager_failed, "Failed to load changelog") {
+            val currentVersion = BuildConfig.VERSION_NAME.normalizeVersion()
+            val forDevBranch = morpheAPI.isDevBuild
+            val entries = managerEntriesCache.getOrPut(forDevBranch) {
+                morpheAPI.fetchManagerChangelog(forDevBranch = forDevBranch)
+            }
+            currentChannelChangelogEntries = if (forDevBranch) {
+                val installedIdx = entries.indexOfFirst { it.version.normalizeVersion() == currentVersion }
+                // Fall back to the newest dev entry when the installed version is absent
+                val start = if (installedIdx >= 0) installedIdx else 0
+                entries.drop(start).takeWhile { it.isPrerelease }
+            } else {
+                listOfNotNull(ChangelogParser.findVersion(entries, currentVersion))
+            }
+        }
+    }
+
+    /**
+     * Loads older stable changelog entries on demand. Always reads from main; older history
+     * is the stable release timeline by definition, regardless of which channel the user is
+     * currently on. Versions already shown above (via [currentChannelChangelogEntries] or
+     * [missedChangelogEntries]) are filtered out so the expander lists new content only.
+     * Idempotent: repeat calls while loading or after a successful load are a no-op.
+     */
+    fun loadOlderManagerEntries() {
+        if (isLoadingOlderEntries || olderManagerEntries != null) return
+        isLoadingOlderEntries = true
+        val exclude = (currentChannelChangelogEntries.orEmpty() + missedChangelogEntries.orEmpty())
+            .map { it.version.normalizeVersion() }
+            .toSet()
+        viewModelScope.launch(Dispatchers.Default) {
+            uiSafe(app, R.string.download_manager_failed, "Failed to load older releases") {
+                val entries = managerEntriesCache.getOrPut(false) {
+                    morpheAPI.fetchManagerChangelog(forDevBranch = false)
+                }
+                olderManagerEntries = entries.filter {
+                    it.version.normalizeVersion() !in exclude && !it.isPrerelease
+                }
+            }
+            isLoadingOlderEntries = false
+        }
+    }
+
+    fun resetOlderManagerEntries() {
+        olderManagerEntries = null
+        isLoadingOlderEntries = false
+    }
+
+    companion object {
+        private val EXTERNAL_INSTALL_TIMEOUT = 60.seconds
+    }
+
+    enum class State(@param:StringRes val title: Int) {
+        CAN_DOWNLOAD(R.string.update_available),
+        DOWNLOADING(R.string.downloading_manager_update),
+        CAN_INSTALL(R.string.ready_to_install_update),
+        INSTALLING(R.string.installing_manager_update),
+        FAILED(R.string.install_update_manager_failed),
+        SUCCESS(R.string.update_completed)
+    }
+}
