@@ -28,6 +28,9 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build Debug APK
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./gradlew assembleDebug -PsignAsDebug -PnoProguard
 
       - name: Rename APK
@@ -53,3 +56,4 @@ jobs:
             Telepítsd az APK-t az Android telefonodra!
           files: release-output/SzabyManager.apk
           make_latest: true
+
